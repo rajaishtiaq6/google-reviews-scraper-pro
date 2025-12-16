@@ -185,9 +185,27 @@ class GoogleReviewsScraper:
         opts.add_argument("--disable-dev-shm-usage")  # Helps with stability
         opts.add_argument("--no-sandbox")  # More stable in some environments
 
+        # Additional stealth options to avoid detection
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-plugins-discovery")
+        opts.add_argument("--start-maximized")
+
+        # Set user agent to look more like a real browser
+        opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+
         # Use headless mode if requested
         if headless:
-            opts.add_argument("--headless=new")
+            # Note: Using old headless mode as Google Maps detects new headless mode
+            # Try without headless first, then fall back if needed
+            opts.add_argument("--headless")  # Old headless mode
+            # Additional headless-specific options for stealth
+            opts.add_argument("--disable-software-rasterizer")
+            opts.add_argument("--disable-background-timer-throttling")
+            opts.add_argument("--disable-backgrounding-occluded-windows")
+            opts.add_argument("--disable-renderer-backgrounding")
+            # Window size is important in headless mode
+            opts.add_argument("--window-size=1920,1080")
 
         # Log platform information for debugging
         log.info(f"Platform: {platform.platform()}")
@@ -230,12 +248,33 @@ class GoogleReviewsScraper:
         else:
             # On regular OS, use default undetected_chromedriver
             log.info("Using standard undetected_chromedriver setup")
-            # Use version_main to match the installed Chrome version (141)
-            # Set to None to auto-detect, or specify explicitly like version_main=141
-            driver = uc.Chrome(options=opts, version_main=141, use_subprocess=True)
+            # Auto-detect Chrome version instead of hardcoding
+            driver = uc.Chrome(options=opts, version_main=None, use_subprocess=True)
 
         # Set page load timeout to avoid hanging
         driver.set_page_load_timeout(30)
+
+        # Additional stealth: Execute JavaScript to mask automation
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                    window.chrome = {
+                        runtime: {}
+                    };
+                '''
+            })
+        except Exception as e:
+            log.debug(f"Could not execute CDP commands for stealth: {e}")
+
         log.info("Chrome driver setup completed successfully")
         return driver
 
@@ -1116,10 +1155,73 @@ class GoogleReviewsScraper:
             time.sleep(1)
 
             # Use try-except to handle cases where the pane is not found
-            try:
-                pane = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, PANE_SEL)))
-            except TimeoutException:
-                log.warning("Could not find reviews pane. Page structure might have changed.")
+            # Try multiple selectors for the reviews pane
+            pane = None
+            pane_selectors = [
+                PANE_SEL,  # Original selector
+                'div[role="main"] div.m6QErb',  # Less specific - just the container
+                'div.m6QErb.DxyBCb',  # Alternative combination
+                'div[data-review-id]',  # If we can find review cards, we can scroll the parent
+            ]
+
+            for selector in pane_selectors:
+                try:
+                    log.debug(f"Trying pane selector: {selector}")
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        # For review cards, get the scrollable parent
+                        if selector == 'div[data-review-id]':
+                            pane = driver.execute_script("""
+                                var el = arguments[0];
+                                while (el && el.parentElement) {
+                                    var style = window.getComputedStyle(el);
+                                    if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+                                        return el;
+                                    }
+                                    el = el.parentElement;
+                                }
+                                return null;
+                            """, elements[0])
+                        else:
+                            pane = elements[0]
+
+                        if pane:
+                            log.info(f"Found reviews pane using selector: {selector}")
+                            break
+                except Exception as e:
+                    log.debug(f"Selector {selector} failed: {e}")
+                    continue
+
+            if not pane:
+                log.warning("Could not find reviews pane with any selector. Page structure might have changed.")
+                # Take a screenshot for debugging
+                try:
+                    screenshot_path = "debug_screenshot.png"
+                    driver.save_screenshot(screenshot_path)
+                    log.info(f"Saved debug screenshot to {screenshot_path}")
+                except:
+                    pass
+
+                # Debug: Log page structure
+                try:
+                    page_info = driver.execute_script("""
+                        return {
+                            url: window.location.href,
+                            title: document.title,
+                            hasReviewCards: document.querySelectorAll('div[data-review-id]').length,
+                            hasM6QErb: document.querySelectorAll('div.m6QErb').length,
+                            hasDxyBCb: document.querySelectorAll('div.DxyBCb').length,
+                            hasRoleMain: document.querySelectorAll('div[role="main"]').length,
+                            scrollableDivs: Array.from(document.querySelectorAll('div')).filter(el => {
+                                const style = window.getComputedStyle(el);
+                                return style.overflowY === 'auto' || style.overflowY === 'scroll';
+                            }).length
+                        };
+                    """)
+                    log.info(f"Page debug info: {page_info}")
+                except Exception as e:
+                    log.debug(f"Could not get page debug info: {e}")
+
                 return False
 
             pbar = tqdm(desc="Scraped", ncols=80, initial=len(seen))
